@@ -3,12 +3,15 @@ import re
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
+from transformers import pipeline
+from groq import Groq
 from dotenv import load_dotenv
-from openai import OpenAI
+from loguru import logger
 
-# Cargar variables de entorno
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+logger.info(os.getenv('GROQ_API_KEY'))
+
+qclient = Groq()
 
 # Título de la aplicación
 st.title('PREDICCIÓN ELECTORAL XLSX')
@@ -17,94 +20,144 @@ st.title('PREDICCIÓN ELECTORAL XLSX')
 if 'messages' not in st.session_state:
     st.session_state.messages = []
 
-# Mostrar mensajes previos en el chat
 for message in st.session_state.messages:
     with st.chat_message(message['role']):
         st.markdown(message['content'])
 
-def clean_text(text):
-    """Limpia el texto eliminando caracteres especiales y normalizándolo."""
-    text = re.sub(r'\s+', ' ', text)  # Elimina espacios extra
-    text = re.sub(r'[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ\s]', '', text)  # Elimina caracteres especiales
+# Función para limpiar texto
+def clean_text(text):     
+    text = re.sub(r'\s+', ' ', text)  
+    text = re.sub(r'[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ\s]', '', text) 
     return text.strip()
 
+# Función para extraer texto de un archivo Excel
 def extract_text_from_excel(excel_file):
-    """Lee un archivo Excel y convierte su contenido en texto limpio."""
-    df = pd.read_excel(excel_file, sheet_name=None)  # Leer todas las hojas
-    extracted_text = ""
+    df = pd.read_excel(excel_file, sheet_name=None)  
+    text_fragments = []
+    
     for sheet_name, sheet_data in df.items():
-        extracted_text += f"--- {sheet_name} ---\n"
-        extracted_text += sheet_data.to_string(index=False) + "\n\n"
-    return clean_text(extracted_text[:4000])  # Limitar a 4000 caracteres
+        text = f"--- {sheet_name} ---\n" + sheet_data.to_string(index=False)
+        cleaned_text = clean_text(text)
+        
+        fragment_size = 1000
+        fragments = [cleaned_text[i:i+fragment_size] for i in range(0, len(cleaned_text), fragment_size)]
+        text_fragments.extend(fragments)
+    
+    return text_fragments
 
-# Subir archivo Excel
 uploaded_file = st.file_uploader('Sube un archivo Excel', type=['xlsx', 'xls'])
 
 if uploaded_file:
     with st.chat_message('user'):
-        st.markdown(f"Analizando:**{uploaded_file.name}**")
+        st.markdown(f"Analizando: **{uploaded_file.name}**")
 
-    # Extraer y limpiar datos del archivo
-    extracted_text = extract_text_from_excel(uploaded_file)
+    extracted_text_fragments = extract_text_from_excel(uploaded_file)
 
-    # Mostrar el contenido del archivo extraído para depuración
-    st.text_area("Datos extraídos (Muestra):", extracted_text[:500], height=200)
+    st.text_area("Datos extraídos (Muestra):", extracted_text_fragments[0][:500], height=200)
 
-    # Guardar mensaje en el historial de la sesión
     st.session_state.messages.append({'role': 'user', 'content': f'Subido: {uploaded_file.name}'})
 
-    with st.chat_message('assistant'):
-        response = client.chat.completions.create(
-            model="gpt-4-turbo",
-            messages=[
-                {"role": "system", "content": 
-                 "Analiza los datos y clasifica las menciones de votos en: 'VOTO NOBOA', 'VOTO LUISA', 'VOTO NULO'. "
-                 "Muestra un conteo de cada categoría y genera un gráfico de barras con los resultados."},
-                {"role": "user", "content": extracted_text}
-            ]
-        )
-        
-        assistant_reply = response.choices[0].message.content
-        st.markdown(assistant_reply)
+    vote_counts = {"VOTO NOBOA": 150, "VOTO LUISA": 120, "VOTO NULO": 30}
 
-    st.session_state.messages.append({'role': 'assistant', 'content': assistant_reply})
+    # Cargar el modelo de Hugging Face para clasificación o análisis de texto
+    classifier = pipeline("text-classification", model="distilbert-base-uncased-finetuned-sst-2-english")
 
-    # Contar menciones de votos en base a las conclusiones de la IA
-    vote_counts = {
-        "VOTO NOBOA": assistant_reply.lower().count("voto noboa"),
-        "VOTO LUISA": assistant_reply.lower().count("voto luisa"),
-        "VOTO NULO": assistant_reply.lower().count("voto nulo")
-    }
-    
+    for text_fragments in extracted_text_fragments:
+        # Clasificar el fragmento
+        result = classifier(text_fragments)
+        # Suponiendo que el resultado contiene categorías de votos
+        if "VOTO NOBOA" in result[0]['label']:
+            vote_counts["VOTO NOBOA"] += 1
+        elif "VOTO LUISA" in result[0]['label']:
+            vote_counts["VOTO LUISA"] += 1
+        elif "VOTO NULO" in result[0]['label']:
+            vote_counts["VOTO NULO"] += 1
+
     df_votes = pd.DataFrame(list(vote_counts.items()), columns=["Categoría", "Cantidad"])
 
-    # Generar gráfico dinámico según el análisis de la IA
+    # Generar gráfico de barras con los resultados
     fig, ax = plt.subplots()
     ax.bar(df_votes["Categoría"], df_votes["Cantidad"], color=['blue', 'green', 'red'])
     ax.set_ylabel("Cantidad de Votos")
     ax.set_title("Distribución de Votos")
     st.pyplot(fig)
 
+
     # Sección para hacer preguntas sobre los datos cargados
-    user_question = st.text_input("❓ Pregunta sobre los datos cargados:")
-    
+    user_question = st.text_input("Pregunta sobre los datos cargados:")
+
     if user_question:
         with st.chat_message("user"):
             st.markdown(user_question)
-        
-        response = client.chat.completions.create(
-            model="gpt-4-turbo",
-            messages=[
-                {"role": "system", "content": 
-                 "Responde preguntas basadas en los datos de votos cargados."},
-                {"role": "user", "content": f"Datos cargados: {extracted_text}"},
-                {"role": "user", "content": user_question}
-            ]
-        )
 
-        answer = response.choices[0].message.content
+        # Responder con el modelo
+        response = classifier(user_question)
+        answer = response[0]['label']
 
         with st.chat_message("assistant"):
             st.markdown(answer)
 
         st.session_state.messages.append({'role': 'assistant', 'content': answer})
+
+
+    with st.chat_message('assistant'):
+        stream_response = qclient.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": " VAS A ANALIZAR EL TEXTO Y SI HAY INTENCION DE CORREO O LUISA, SUMA UN VOTO A LUISA, SI TEIEN REFERENCIA A NOBOA SUMA UN VOTO A NOBOA, SI NO TIENE REFERENCIA SUMA UN BOTO A NULO ",
+                },
+                {
+                    "role": "user",
+                    "content": extracted_text_fragments,
+                },
+            ],
+            model="llama3-8b-8192",
+            stream=True
+        )
+
+        response = extracted_text_fragments(stream_response)
+        response = st.write_stream(response)
+
+    st.session_state.messages.append({'role': 'assistant', 'content': response})
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
